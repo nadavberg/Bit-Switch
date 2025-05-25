@@ -1,0 +1,2151 @@
+desc:Bit Switch 64
+options:no_meter maxmem=512 gfx_hz=30
+
+/////////////
+// SLIDERS //
+/////////////
+
+<?
+  slider_count = 0;
+  function add_slider(variable, default, minimum, maximum, increment, description) (
+      slider_count += 1;
+      printf("slider%d:%s=%f<%f, %f, %f>%s\n", slider_count, variable, default, minimum, maximum, increment, description);
+  );
+  function add_menu(variable, default, number, options, description) (
+      slider_count += 1;
+      printf("slider%d:%s=%f<0, %f, 1{%s}>%s\n", slider_count, variable, default, number, options, description);
+  );
+  add_menu("switch_mode", 0, 3, "Break,Jam,Reverse", "-Switch Mode");
+  add_menu("representation", 0, 2, "Fixed Point,Floating Point", "-Representation");
+  add_menu("twos_complement", 1, 2, "Off,On", "-Two's Complement");
+  add_menu("channel_mode", 0, 2, "Stereo, Left, Right, Sum", "-Channel Mode");
+  //add_menu("do_mapping", 1, 2, "Off,On", "-Mapping");
+  add_menu("do_dc_filter", 1, 2, "Off,On", "-DC Filter");
+  add_menu("do_clipping", 1, 2, "Off,On", "-Clipper");
+  add_menu("do_blinking", 1, 2, "Off,On", "-Blinking");
+  add_slider("input_gain", 0, -24, 24, 1, "-Input Gain");
+  add_slider("output_gain", 0, -24, 24, 1, "-Output Gain");
+  add_menu("xy_logging", 0, 2, "Off,On", "-Log Mouse (x,y)");
+  add_slider("aa_r", 87, 0, 255, 1,           "-Red");
+  add_slider("aa_g", 87, 0, 255, 1,           "-Green");
+  add_slider("aa_b", 62, 0, 255, 1,           "-Blue");
+  add_slider("aa_dx", -0.04, -.2, .2, 0.001,  "-dx");
+  add_slider("aa_dy", -0.09, -.2, .2, 0.001,  "-dy");
+  add_slider("aa_br", 0, -.2, .2, 0.001,      "-br");
+  add_menu("hit_boxes", 0, 2, "Off,On", "-Hit Boxes");
+  add_menu("do_link", 0, 2, "Off,On", "-Link Input-Output");
+  add_menu("numbering", 0, 4, "MSB=63,MSB=0,MSB=64,MSB=1", "-Bit Numbering");
+?>
+// </SLIDERS>
+
+@init
+ext_nodenorm = 1;
+ext_noinit = 1;
+
+// Intialize power of 2 constants:
+<? loop(i = 0; j = 1; 32, printf("POWER_%02d=%f;", i, j); i += 1; j *= 2;); ?>
+POWER_32=2^32; INVERSE_POWER_32=2^-32;
+POWER_52=2^52; INVERSE_POWER_52=2^-52;
+POWER_63=2^63; INVERSE_POWER_63=2^-63;
+INVERSE_POWER_20=2^-20;
+INVERSE_POWER_31=2^-31;
+
+initialize_ui_flag = 1;
+update_switch_panel_flag = 1;
+do_mapping = 1;
+freembuf(1000);
+
+input_gain.target_value = input_gain.smooth_value = 1;
+output_gain.target_value = output_gain.smooth_value = 1;
+
+////////////////////
+// MISC FUNCTIONS //
+////////////////////
+
+@init
+
+function timer_tick()
+(
+    this ? this -= 1;
+    this.phase = (this.range - this) / this.range;
+    this == 0;
+);
+function timer_set(n) ( this.range = n; );
+function timer_reset() ( this = this.range; );
+function timer_phase() ( (this.range - this) / this.range; );
+
+function reset_enumeration(n) ( enumerator = n; );
+function enumerate() ( this = enumerator; enumerator += 1; );
+
+function clip(x, h) ( max(-h, min(h, x)); );
+function clip(x, low, high) ( max(low, min(high, x)); );
+
+DB_CONSTANT = log(10) / 20;
+function dB_to_amplitude(x) ( exp(x * DB_CONSTANT); );
+
+function logr() ( #dbg_desc = ""; log_counter = 0; );
+
+function logd(x)
+(
+    sprintf(#0, "\t[%d] ", log_counter += 1);
+    strncat(#dbg_desc, #0, strlen(#0));
+    sprintf(#0, "%d\t", x);
+    strncat(#dbg_desc, #0, strlen(#0));
+);
+
+
+function logf(x)
+(
+    sprintf(#0, "\t[%d] ", log_counter += 1);
+    strncat(#dbg_desc, #0, strlen(#0));
+    sprintf(#0, "%f", x);
+    strncat(#dbg_desc, #0, strlen(#0));
+);
+
+function logx(x)
+(
+    sprintf(#0, "\t[%d] ", log_counter += 1);
+    strncat(#dbg_desc, #0, strlen(#0));
+    sprintf(#0, "0x%X", x);
+    strncat(#dbg_desc, #0, strlen(#0));
+);
+
+function logcmp(A,B)
+(
+    sprintf(#0, "\t[%d] ", log_counter += 1);
+    strncat(#dbg_desc, #0, strlen(#0)); 
+    strncat(#dbg_desc, A < B ? "A < B" : A > B ? "A > B" : "A = B", 5);
+);
+
+function logb(U,L)
+(
+    #dbg_desc = "";
+    representation == FIXED ?
+    (
+        loop(j = 1; 32,
+            U & 2^(32 - j) ? strncat(#dbg_desc,"1",1) : strncat(#dbg_desc,"0",1);
+            !(j % 8) ? strncat(#dbg_desc," ",1);
+        j += 1);
+        loop(j = 1; 32,
+            L & 2^(32 - j) ? strncat(#dbg_desc,"1",1) : strncat(#dbg_desc,"0",1);
+            !(j % 8) ? strncat(#dbg_desc," ",1);
+        j += 1);
+    ) :
+    (
+        strncat(#dbg_desc,"S:",2);
+        U & 2^(31) ? strncat(#dbg_desc,"1",1) : strncat(#dbg_desc,"0",1);
+        strncat(#dbg_desc," E:",3);
+        loop(j = 2; 11,
+            U & 2^(32 - j) ? strncat(#dbg_desc,"1",1) : strncat(#dbg_desc,"0",1);
+        j += 1);
+        strncat(#dbg_desc," M:",31);
+        loop(20,
+            U & 2^(32 - j) ? strncat(#dbg_desc,"1",1) : strncat(#dbg_desc,"0",1);
+            !(j % 4) ? strncat(#dbg_desc," ",1);
+        j += 1);
+        strncat(#dbg_desc,"- ",2);
+        loop(j = 1; 32,
+            L & 2^(32 - j) ? strncat(#dbg_desc,"1",1) : strncat(#dbg_desc,"0",1);
+            !(j % 4) ? strncat(#dbg_desc," ",1);
+        j += 1);
+    );
+);
+// </MISC FUNCTIONS>
+
+// Define Enums:
+reset_enumeration(0);
+    FIXED.enumerate();
+    FLOAT.enumerate();
+reset_enumeration(0);
+    BREAK.enumerate();
+    JAM.enumerate();
+    REVERSE.enumerate();
+reset_enumeration(0);
+    STEREO.enumerate();
+    LEFT.enumerate();
+    RIGHT.enumerate();
+    MIX.enumerate();
+
+///////////////////
+// DSP FUNCTIONS //
+///////////////////
+
+smoothing_factor = exp(-6);
+function parameter_smoothing()
+instance(smooth_value target_value)
+(
+    smooth_value != target_value ?
+        smooth_value += smoothing_factor * (target_value - smooth_value)
+        :
+        smooth_value = target_value;
+);
+
+function transform(x)
+local(negative exponent error NaN INF denormal _upper_bits _lower_bits out upper_bits lower_bits)
+(
+    // DECOMPOSITION:
+    x === 0 ?
+    (
+        upper_bits = 0;
+        lower_bits = 0;
+    ) :
+    representation == FIXED ?
+    (
+    negative = x < 0;
+        twos_complement ?
+        (
+            x = clip(x, 1);
+            x === 1 ?
+            (
+                upper_bits = $~31;
+                lower_bits = $~32;
+            ) :
+            (
+                x *= POWER_63;
+                upper_bits = floor(x * INVERSE_POWER_32);
+                lower_bits = x & $~32;
+            );
+        ) :
+        // !twos_complement ?
+        (
+            negative = x < 0;
+            x = abs(clip(x, 2));
+            x === 2 ?
+            (
+                upper_bits = $~32;
+                lower_bits = $~32;
+            ) :
+            (
+                x *= POWER_63;
+                upper_bits = floor(x * INVERSE_POWER_32);
+                lower_bits = x & $~32;
+            );
+        );
+    ) :
+    // representation == FLOAT ?
+    (
+        upper_bits = (x < 0) * POWER_31;
+        x = abs(x);
+        exponent = 0;
+        while (x >= 2)
+        (
+            x *= 0.5;
+            exponent += 1;
+        );
+        while (x < 1)
+        (
+            x *= 2;
+            exponent -= 1;
+        );
+        x -= 1;
+        upper_bits |= floor(x * POWER_20);
+        lower_bits = (x * POWER_52) & $~32;
+        upper_bits |= (exponent + 1023) * POWER_20;
+    );
+    
+    upper_bits &= $~32;
+    lower_bits &= $~32;
+    do_mapping ?
+    (
+        _upper_bits = 0;
+        _lower_bits = 0;
+        <?
+            loop(i = 0; 32,
+                printf("switch_%02d.map < POWER_32 ?", i);
+                printf("_lower_bits |= switch_%02d.map * (lower_bits & POWER_%02d || 0) :", i, i);
+                printf("_upper_bits |= INVERSE_POWER_32 *switch_%02d.map * (lower_bits & POWER_%02d || 0);", i, i);
+            i += 1);
+            loop(32,
+                printf("switch_%02d.map < POWER_32 ?", i);
+                printf("_lower_bits |= switch_%d.map * (upper_bits & POWER_%02d || 0) :", i, i - 32);
+                printf("_upper_bits |= INVERSE_POWER_32 * switch_%d.map * (upper_bits & POWER_%02d || 0);", i, i - 32);
+            i += 1);
+        ?>
+        lower_bits = _lower_bits;
+        upper_bits = _upper_bits;
+    );
+    
+    switches.upper_bits || switches.lower_bits ?
+    (
+        switch_mode == BREAK ?
+        (
+            upper_bits &= (switches.upper_bits ~ $~32);
+            lower_bits &= (switches.lower_bits ~ $~32);
+        ) :
+        switch_mode == JAM ?
+        (
+            upper_bits |= switches.upper_bits;
+            lower_bits |= switches.lower_bits;
+        ) :
+        switch_mode == REVERSE ?
+        (
+            upper_bits ~= switches.upper_bits;
+            lower_bits ~= switches.lower_bits;
+        );
+    );
+    
+    // "Sign Extention" post transform:
+    representation == FIXED && twos_complement && (upper_bits & POWER_31) ? upper_bits |= -1 ~ $~32; 
+    
+    // RECONSTRUCTION:
+    NaN = INF = denormal = 0;
+    out = 0;
+    upper_bits == 0 && lower_bits == 0 ?
+    (
+        //out = 0;
+        1; // skip
+    ) :
+    representation == FIXED ?
+    (
+        out = upper_bits * INVERSE_POWER_31;
+        out += lower_bits * INVERSE_POWER_63;
+        !twos_complement && negative ? out *= -1;
+    ) :
+    // representation == FLOAT ?
+    (
+        exponent = ((upper_bits * INVERSE_POWER_20) & $~11) - 1023;
+        exponent == 1024 ?
+        (
+            NaN = ((upper_bits & $~20) || lower_bits);
+            INF = !NaN;
+            // out = 0;
+        ) :
+        exponent == -1023 ?
+        (
+            denormal = 1;
+            // out = 0;
+        ) :
+        (
+            out = (upper_bits & $~20) * INVERSE_POWER_20 + 1;
+            out += lower_bits * INVERSE_POWER_52;
+            out *= 2^exponent;
+            upper_bits & POWER_31 ? out *= -1;
+        );
+    );
+    
+    out;
+);
+
+function dc_filter(in)
+local(out)
+instance(dc_last_in dc_last_out)
+(
+    out = in;
+    do_dc_filter ? out += 0.999 * dc_last_out - dc_last_in;
+    dc_last_in = in;
+    dc_last_out = out;
+);
+
+function clipper(in) ( do_clipping ? clip(in, 1) : in; );
+
+function transform_ui()
+local(x negative exponent error NaN INF _upper_bits _lower_bits _out)
+instance(upper_bits lower_bits)
+(
+    x = this;
+    x === 0 ?
+    (
+        upper_bits = 0;
+        lower_bits = 0;
+    ) :
+    representation == FIXED ?
+    (
+    negative = x < 0;
+        twos_complement ?
+        (
+            x = clip(x, 1);
+            x === 1 ?
+            (
+                upper_bits = $~31;
+                lower_bits = $~32;
+            ) :
+            (
+                x *= POWER_63;
+                upper_bits = floor(x * INVERSE_POWER_32);
+                lower_bits = x & $~32;
+            );
+        ) :
+        // !twos_complement ?
+        (
+            negative = x < 0;
+            x = abs(clip(x, 2));
+            x === 2 ?
+            (
+                upper_bits = $~32;
+                lower_bits = $~32;
+            ) :
+            (
+                x *= POWER_63;
+                upper_bits = floor(x * INVERSE_POWER_32);
+                lower_bits = x & $~32;
+            );
+        );
+    ) :
+    // representation == FLOAT ?
+    (
+        upper_bits = (x < 0) * POWER_31;
+        x = abs(x);
+        exponent = 0;
+        while (x >= 2)
+        (
+            x *= 0.5;
+            exponent += 1;
+        );
+        while (x < 1)
+        (
+            x *= 2;
+            exponent -= 1;
+        );
+        x -= 1;
+        upper_bits |= floor(x * POWER_20);
+        lower_bits = (x * POWER_52) & $~32;
+        upper_bits |= (exponent + 1023) * POWER_20;
+    );
+    
+    upper_bits &= $~32;
+    lower_bits &= $~32;
+    
+    do_mapping ?
+    (
+        _upper_bits = 0;
+        _lower_bits = 0;
+        <?
+            loop(i = 0; 32,
+                printf("switch_%02d.map < POWER_32 ?", i);
+                printf("_lower_bits |= switch_%02d.map * (lower_bits & POWER_%02d || 0) :", i, i);
+                printf("_upper_bits |= INVERSE_POWER_32 *switch_%02d.map * (lower_bits & POWER_%02d || 0);", i, i);
+            i += 1);
+            loop(32,
+                printf("switch_%02d.map < POWER_32 ?", i);
+                printf("_lower_bits |= switch_%d.map * (upper_bits & POWER_%02d || 0) :", i, i - 32);
+                printf("_upper_bits |= INVERSE_POWER_32 * switch_%d.map * (upper_bits & POWER_%02d || 0);", i, i - 32);
+            i += 1);
+        ?>
+        lower_bits = _lower_bits;
+        upper_bits = _upper_bits;
+    );
+    
+    switches.upper_bits || switches.lower_bits ?
+    (
+        switch_mode == BREAK ?
+        (
+            upper_bits &= (switches.upper_bits ~ $~32);
+            lower_bits &= (switches.lower_bits ~ $~32);
+        ) :
+        switch_mode == JAM ?
+        (
+            upper_bits |= switches.upper_bits;
+            lower_bits |= switches.lower_bits;
+        ) :
+        switch_mode == REVERSE ?
+        (
+            upper_bits ~= switches.upper_bits;
+            lower_bits ~= switches.lower_bits;
+        );
+    );
+    
+    // "Sign Extention" post transform: Remove?
+    representation == FIXED && twos_complement && (upper_bits & POWER_31) ? upper_bits |= -1 ~ $~32;
+);
+// </DSP FUNCTIONS>
+
+/////////////////////
+// COLOR FUNCTIONS //
+/////////////////////
+
+ONE_OVER_255 = 1 / 255;
+
+function set_color(c)
+(
+    gfx_r = (c & 0xFF) * ONE_OVER_255;
+    gfx_g = ((c = c >> 8) & 0xFF) * ONE_OVER_255;
+    gfx_b = ((c = c >> 8) & 0xFF) * ONE_OVER_255;
+);
+
+function set_color(c, a)
+(
+    gfx_r = (c & 0xFF) * ONE_OVER_255;
+    gfx_g = ((c = c >> 8) & 0xFF) * ONE_OVER_255;
+    gfx_b = ((c = c >> 8) & 0xFF) * ONE_OVER_255;
+    gfx_a = a;
+);
+
+function set_color_blend(c1, c2, p)
+local(r1 r2 g1 g2 b1 b2)
+(
+    r1 = (c1 & 0xFF) * ONE_OVER_255;
+    g1 = ((c1 = c1 >> 8) & 0xFF) * ONE_OVER_255;
+    b1 = ((c1 = c1 >> 8) & 0xFF) * ONE_OVER_255;
+    r2 = (c2 & 0xFF) * ONE_OVER_255;
+    g2 = ((c2 = c2 >> 8) & 0xFF) * ONE_OVER_255;
+    b2 = ((c2 = c2 >> 8) & 0xFF) * ONE_OVER_255;
+    gfx_r = r1 + p * (r2 - r1);
+    gfx_g = g1 + p * (g2 - g1);
+    gfx_b = b1 + p * (b2 - b1);
+    gfx_a = 1;
+);
+
+function define_color(r,g,b)
+(
+    r + (g << 8) + (b << 16);
+);
+
+function gradient(x, y, w, h, color*, adj_w, adj_h)
+(
+    gfx_gradrect(x, y, w, h,
+                 color.red, color.green, color.blue, 1,
+                 adj_w/w, adj_w/w, adj_w/w, 0,
+                 adj_h/h, adj_h/h, adj_h/h, 0);
+);
+
+color__White = define_color(0xFF, 0xFF, 0xFF);
+color__Black = define_color(0x00, 0x00, 0x00);
+
+color__Slate_05 = define_color(0xF8, 0xFA, 0xFC);
+color__Slate_10 = define_color(0xF1, 0xF5, 0xF9);
+color__Slate_20 = define_color(0xE2, 0xE8, 0xF0);
+color__Slate_30 = define_color(0xCB, 0xD5, 0xE1);
+color__Slate_40 = define_color(0x94, 0xA3, 0xB8);
+color__Slate_50 = define_color(0x64, 0x74, 0x8B);
+color__Slate_60 = define_color(0x47, 0x55, 0x69);
+color__Slate_70 = define_color(0x33, 0x41, 0x55);
+color__Slate_80 = define_color(0x1E, 0x29, 0x3B);
+color__Slate_90 = define_color(0x0F, 0x17, 0x2A);
+color__Slate_95 = define_color(0x02, 0x06, 0x17);
+
+color__Gray_05 = define_color(0xF9, 0xFA, 0xFB);
+color__Gray_10 = define_color(0xF3, 0xF4, 0xF6);
+color__Gray_20 = define_color(0xE5, 0xE7, 0xEB);
+color__Gray_30 = define_color(0xD1, 0xD5, 0xDB);
+color__Gray_40 = define_color(0x9C, 0xA3, 0xAF);
+color__Gray_50 = define_color(0x6B, 0x72, 0x80);
+color__Gray_60 = define_color(0x4B, 0x55, 0x63);
+color__Gray_70 = define_color(0x37, 0x41, 0x51);
+color__Gray_80 = define_color(0x1F, 0x29, 0x37);
+color__Gray_90 = define_color(0x11, 0x18, 0x27);
+color__Gray_95 = define_color(0x03, 0x07, 0x12);
+
+color__Zinc_05 = define_color(0xFA, 0xFA, 0xFA);
+color__Zinc_10 = define_color(0xF4, 0xF4, 0xF5);
+color__Zinc_20 = define_color(0xE4, 0xE4, 0xE7);
+color__Zinc_30 = define_color(0xD4, 0xD4, 0xD8);
+color__Zinc_40 = define_color(0xA1, 0xA1, 0xAA);
+color__Zinc_50 = define_color(0x71, 0x71, 0x7A);
+color__Zinc_60 = define_color(0x52, 0x52, 0x5B);
+color__Zinc_70 = define_color(0x3F, 0x3F, 0x46);
+color__Zinc_80 = define_color(0x27, 0x27, 0x2A);
+color__Zinc_90 = define_color(0x18, 0x18, 0x1B);
+color__Zinc_95 = define_color(0x09, 0x09, 0x0B);
+
+color__Neutral_05 = define_color(0xFA, 0xFA, 0xFA);
+color__Neutral_10 = define_color(0xF5, 0xF5, 0xF5);
+color__Neutral_20 = define_color(0xE5, 0xE5, 0xE5);
+color__Neutral_30 = define_color(0xD4, 0xD4, 0xD4);
+color__Neutral_40 = define_color(0xA3, 0xA3, 0xA3);
+color__Neutral_50 = define_color(0x73, 0x73, 0x73);
+color__Neutral_60 = define_color(0x52, 0x52, 0x52);
+color__Neutral_70 = define_color(0x40, 0x40, 0x40);
+color__Neutral_80 = define_color(0x26, 0x26, 0x26);
+color__Neutral_90 = define_color(0x17, 0x17, 0x17);
+color__Neutral_95 = define_color(0x0A, 0x0A, 0x0A);
+
+color__Stone_05 = define_color(0xFA, 0xFA, 0xF9);
+color__Stone_10 = define_color(0xF5, 0xF5, 0xF4);
+color__Stone_20 = define_color(0xE7, 0xE5, 0xE4);
+color__Stone_30 = define_color(0xD6, 0xD3, 0xD1);
+color__Stone_40 = define_color(0xA8, 0xA2, 0x9E);
+color__Stone_50 = define_color(0x78, 0x71, 0x6C);
+color__Stone_60 = define_color(0x57, 0x53, 0x4E);
+color__Stone_70 = define_color(0x44, 0x40, 0x3C);
+color__Stone_80 = define_color(0x29, 0x25, 0x24);
+color__Stone_90 = define_color(0x1C, 0x19, 0x17);
+color__Stone_95 = define_color(0x0C, 0x0A, 0x09);
+
+color__Red_05 = define_color(0xFE, 0xF2, 0xF2);
+color__Red_10 = define_color(0xFE, 0xE2, 0xE2);
+color__Red_20 = define_color(0xFE, 0xCA, 0xCA);
+color__Red_30 = define_color(0xFC, 0xA5, 0xA5);
+color__Red_40 = define_color(0xF8, 0x71, 0x71);
+color__Red_50 = define_color(0xEF, 0x44, 0x44);
+color__Red_60 = define_color(0xDC, 0x26, 0x26);
+color__Red_70 = define_color(0xB9, 0x1C, 0x1C);
+color__Red_80 = define_color(0x99, 0x1B, 0x1B);
+color__Red_90 = define_color(0x7F, 0x1D, 0x1D);
+color__Red_95 = define_color(0x45, 0x0A, 0x0A);
+
+color__Orange_05 = define_color(0xFF, 0xF7, 0xED);
+color__Orange_10 = define_color(0xFF, 0xED, 0xD5);
+color__Orange_20 = define_color(0xFE, 0xD7, 0xAA);
+color__Orange_30 = define_color(0xFD, 0xBA, 0x74);
+color__Orange_40 = define_color(0xFB, 0x92, 0x3C);
+color__Orange_50 = define_color(0xF9, 0x73, 0x16);
+color__Orange_60 = define_color(0xEA, 0x58, 0x0C);
+color__Orange_70 = define_color(0xC2, 0x41, 0x0C);
+color__Orange_80 = define_color(0x9A, 0x34, 0x12);
+color__Orange_90 = define_color(0x7C, 0x2D, 0x12);
+color__Orange_95 = define_color(0x43, 0x14, 0x07);
+
+color__Amber_05 = define_color(0xFF, 0xFB, 0xEB);
+color__Amber_10 = define_color(0xFE, 0xF3, 0xC7);
+color__Amber_20 = define_color(0xFD, 0xE6, 0x8A);
+color__Amber_30 = define_color(0xFC, 0xD3, 0x4D);
+color__Amber_40 = define_color(0xFB, 0xBF, 0x24);
+color__Amber_50 = define_color(0xF5, 0x9E, 0x0B);
+color__Amber_60 = define_color(0xD9, 0x77, 0x06);
+color__Amber_70 = define_color(0xB4, 0x53, 0x09);
+color__Amber_80 = define_color(0x92, 0x40, 0x0E);
+color__Amber_90 = define_color(0x78, 0x35, 0x0F);
+color__Amber_95 = define_color(0x45, 0x1A, 0x03);
+
+color__Yellow_05 = define_color(0xFE, 0xFC, 0xE8);
+color__Yellow_10 = define_color(0xFE, 0xF9, 0xC3);
+color__Yellow_20 = define_color(0xFE, 0xF0, 0x8A);
+color__Yellow_30 = define_color(0xFD, 0xE0, 0x47);
+color__Yellow_40 = define_color(0xFA, 0xCC, 0x15);
+color__Yellow_50 = define_color(0xEA, 0xB3, 0x08);
+color__Yellow_60 = define_color(0xCA, 0x8A, 0x04);
+color__Yellow_70 = define_color(0xA1, 0x62, 0x07);
+color__Yellow_80 = define_color(0x85, 0x4D, 0x0E);
+color__Yellow_90 = define_color(0x71, 0x3F, 0x12);
+color__Yellow_95 = define_color(0x42, 0x20, 0x06);
+
+color__Lime_05 = define_color(0xF7, 0xFE, 0xE7);
+color__Lime_10 = define_color(0xEC, 0xFC, 0xCB);
+color__Lime_20 = define_color(0xD9, 0xF9, 0x9D);
+color__Lime_30 = define_color(0xBE, 0xF2, 0x64);
+color__Lime_40 = define_color(0xA3, 0xE6, 0x35);
+color__Lime_50 = define_color(0x84, 0xCC, 0x16);
+color__Lime_60 = define_color(0x65, 0xA3, 0x0D);
+color__Lime_70 = define_color(0x4D, 0x7C, 0x0F);
+color__Lime_80 = define_color(0x3F, 0x62, 0x12);
+color__Lime_90 = define_color(0x36, 0x53, 0x14);
+color__Lime_95 = define_color(0x1A, 0x2E, 0x05);
+
+color__Green_05 = define_color(0xF0, 0xFD, 0xF4);
+color__Green_10 = define_color(0xDC, 0xFC, 0xE7);
+color__Green_20 = define_color(0xBB, 0xF7, 0xD0);
+color__Green_30 = define_color(0x86, 0xEF, 0xAC);
+color__Green_40 = define_color(0x4A, 0xDE, 0x80);
+color__Green_50 = define_color(0x22, 0xC5, 0x5E);
+color__Green_60 = define_color(0x16, 0xA3, 0x4A);
+color__Green_70 = define_color(0x15, 0x80, 0x3D);
+color__Green_80 = define_color(0x16, 0x65, 0x34);
+color__Green_90 = define_color(0x14, 0x53, 0x2D);
+color__Green_95 = define_color(0x05, 0x2E, 0x16);
+
+color__Emerald_05 = define_color(0xEC, 0xFD, 0xF5);
+color__Emerald_10 = define_color(0xD1, 0xFA, 0xE5);
+color__Emerald_20 = define_color(0xA7, 0xF3, 0xD0);
+color__Emerald_30 = define_color(0x6E, 0xE7, 0xB7);
+color__Emerald_40 = define_color(0x34, 0xD3, 0x99);
+color__Emerald_50 = define_color(0x10, 0xB9, 0x81);
+color__Emerald_60 = define_color(0x05, 0x96, 0x69);
+color__Emerald_70 = define_color(0x04, 0x78, 0x57);
+color__Emerald_80 = define_color(0x06, 0x5F, 0x46);
+color__Emerald_90 = define_color(0x06, 0x4E, 0x3B);
+color__Emerald_95 = define_color(0x02, 0x2C, 0x22);
+
+color__Teal_05 = define_color(0xF0, 0xFD, 0xFA);
+color__Teal_10 = define_color(0xCC, 0xFB, 0xF1);
+color__Teal_20 = define_color(0x99, 0xF6, 0xE4);
+color__Teal_30 = define_color(0x5E, 0xEA, 0xD4);
+color__Teal_40 = define_color(0x2D, 0xD4, 0xBF);
+color__Teal_50 = define_color(0x14, 0xB8, 0xA6);
+color__Teal_60 = define_color(0x0D, 0x94, 0x88);
+color__Teal_70 = define_color(0x0F, 0x76, 0x6E);
+color__Teal_80 = define_color(0x11, 0x5E, 0x59);
+color__Teal_90 = define_color(0x13, 0x4E, 0x4A);
+color__Teal_95 = define_color(0x04, 0x2F, 0x2E);
+
+color__Cyan_05 = define_color(0xEC, 0xFE, 0xFF);
+color__Cyan_10 = define_color(0xCF, 0xFA, 0xFE);
+color__Cyan_20 = define_color(0xA5, 0xF3, 0xFC);
+color__Cyan_30 = define_color(0x67, 0xE8, 0xF9);
+color__Cyan_40 = define_color(0x22, 0xD3, 0xEE);
+color__Cyan_50 = define_color(0x06, 0xB6, 0xD4);
+color__Cyan_60 = define_color(0x08, 0x91, 0xB2);
+color__Cyan_70 = define_color(0x0E, 0x74, 0x90);
+color__Cyan_80 = define_color(0x15, 0x5E, 0x75);
+color__Cyan_90 = define_color(0x16, 0x4E, 0x63);
+color__Cyan_95 = define_color(0x08, 0x33, 0x44);
+
+color__Sky_05 = define_color(0xF0, 0xF9, 0xFF);
+color__Sky_10 = define_color(0xE0, 0xF2, 0xFE);
+color__Sky_20 = define_color(0xBA, 0xE6, 0xFD);
+color__Sky_30 = define_color(0x7D, 0xD3, 0xFC);
+color__Sky_40 = define_color(0x38, 0xBD, 0xF8);
+color__Sky_50 = define_color(0x0E, 0xA5, 0xE9);
+color__Sky_60 = define_color(0x02, 0x84, 0xC7);
+color__Sky_70 = define_color(0x03, 0x69, 0xA1);
+color__Sky_80 = define_color(0x07, 0x59, 0x85);
+color__Sky_90 = define_color(0x0C, 0x4A, 0x6E);
+color__Sky_95 = define_color(0x08, 0x2F, 0x49);
+
+color__Blue_05 = define_color(0xEF, 0xF6, 0xFF);
+color__Blue_10 = define_color(0xDB, 0xEA, 0xFE);
+color__Blue_20 = define_color(0xBF, 0xDB, 0xFE);
+color__Blue_30 = define_color(0x93, 0xC5, 0xFD);
+color__Blue_40 = define_color(0x60, 0xA5, 0xFA);
+color__Blue_50 = define_color(0x3B, 0x82, 0xF6);
+color__Blue_60 = define_color(0x25, 0x63, 0xEB);
+color__Blue_70 = define_color(0x1D, 0x4E, 0xD8);
+color__Blue_80 = define_color(0x1E, 0x40, 0xAF);
+color__Blue_90 = define_color(0x1E, 0x3A, 0x8A);
+color__Blue_95 = define_color(0x17, 0x25, 0x54);
+
+color__Indigo_05 = define_color(0xEE, 0xF2, 0xFF);
+color__Indigo_10 = define_color(0xE0, 0xE7, 0xFF);
+color__Indigo_20 = define_color(0xC7, 0xD2, 0xFE);
+color__Indigo_30 = define_color(0xA5, 0xB4, 0xFC);
+color__Indigo_40 = define_color(0x81, 0x8C, 0xF8);
+color__Indigo_50 = define_color(0x63, 0x66, 0xF1);
+color__Indigo_60 = define_color(0x4F, 0x46, 0xE5);
+color__Indigo_70 = define_color(0x43, 0x38, 0xCA);
+color__Indigo_80 = define_color(0x37, 0x30, 0xA3);
+color__Indigo_90 = define_color(0x31, 0x2E, 0x81);
+color__Indigo_95 = define_color(0x1E, 0x1B, 0x4B);
+
+color__Violet_05 = define_color(0xF5, 0xF3, 0xFF);
+color__Violet_10 = define_color(0xED, 0xE9, 0xFE);
+color__Violet_20 = define_color(0xDD, 0xD6, 0xFE);
+color__Violet_30 = define_color(0xC4, 0xB5, 0xFD);
+color__Violet_40 = define_color(0xA7, 0x8B, 0xFA);
+color__Violet_50 = define_color(0x8B, 0x5C, 0xF6);
+color__Violet_60 = define_color(0x7C, 0x3A, 0xED);
+color__Violet_70 = define_color(0x6D, 0x28, 0xD9);
+color__Violet_80 = define_color(0x5B, 0x21, 0xB6);
+color__Violet_90 = define_color(0x4C, 0x1D, 0x95);
+color__Violet_95 = define_color(0x2E, 0x10, 0x65);
+
+color__Purple_05 = define_color(0xFA, 0xF5, 0xFF);
+color__Purple_10 = define_color(0xF3, 0xE8, 0xFF);
+color__Purple_20 = define_color(0xE9, 0xD5, 0xFF);
+color__Purple_30 = define_color(0xD8, 0xB4, 0xFE);
+color__Purple_40 = define_color(0xC0, 0x84, 0xFC);
+color__Purple_50 = define_color(0xA8, 0x55, 0xF7);
+color__Purple_60 = define_color(0x93, 0x33, 0xEA);
+color__Purple_70 = define_color(0x7E, 0x22, 0xCE);
+color__Purple_80 = define_color(0x6B, 0x21, 0xA8);
+color__Purple_90 = define_color(0x58, 0x1C, 0x87);
+color__Purple_95 = define_color(0x3B, 0x07, 0x64);
+
+color__Fuchsia_05 = define_color(0xFD, 0xF4, 0xFF);
+color__Fuchsia_10 = define_color(0xFA, 0xE8, 0xFF);
+color__Fuchsia_20 = define_color(0xF5, 0xD0, 0xFE);
+color__Fuchsia_30 = define_color(0xF0, 0xAB, 0xFC);
+color__Fuchsia_40 = define_color(0xE8, 0x79, 0xF9);
+color__Fuchsia_50 = define_color(0xD9, 0x46, 0xEF);
+color__Fuchsia_60 = define_color(0xC0, 0x26, 0xD3);
+color__Fuchsia_70 = define_color(0xA2, 0x1C, 0xAF);
+color__Fuchsia_80 = define_color(0x86, 0x19, 0x8F);
+color__Fuchsia_90 = define_color(0x70, 0x1A, 0x75);
+color__Fuchsia_95 = define_color(0x4A, 0x04, 0x4E);
+
+color__Pink_05 = define_color(0xFD, 0xF2, 0xF8);
+color__Pink_10 = define_color(0xFC, 0xE7, 0xF3);
+color__Pink_20 = define_color(0xFB, 0xCF, 0xE8);
+color__Pink_30 = define_color(0xF9, 0xA8, 0xD4);
+color__Pink_40 = define_color(0xF4, 0x72, 0xB6);
+color__Pink_50 = define_color(0xEC, 0x48, 0x99);
+color__Pink_60 = define_color(0xDB, 0x27, 0x77);
+color__Pink_70 = define_color(0xBE, 0x18, 0x5D);
+color__Pink_80 = define_color(0x9D, 0x17, 0x4D);
+color__Pink_90 = define_color(0x83, 0x18, 0x43);
+color__Pink_95 = define_color(0x50, 0x07, 0x24);
+
+color__Rose_05 = define_color(0xFF, 0xF1, 0xF2);
+color__Rose_10 = define_color(0xFF, 0xE4, 0xE6);
+color__Rose_20 = define_color(0xFE, 0xCD, 0xD3);
+color__Rose_30 = define_color(0xFD, 0xA4, 0xAF);
+color__Rose_40 = define_color(0xFB, 0x71, 0x85);
+color__Rose_50 = define_color(0xF4, 0x3F, 0x5E);
+color__Rose_60 = define_color(0xE1, 0x1D, 0x48);
+color__Rose_70 = define_color(0xBE, 0x12, 0x3C);
+color__Rose_80 = define_color(0x9F, 0x12, 0x39);
+color__Rose_90 = define_color(0x88, 0x13, 0x37);
+color__Rose_95 = define_color(0x4C, 0x05, 0x19);
+// </COLOR FUNCTIONS>
+
+@slider
+// xy_logging;
+// p == p;
+// do_clipping == do_clipping ? update_transfer_curve_flag = 1;
+// update_main_background();
+
+@block
+input_gain = input_gain.ui_value;
+output_gain = output_gain.ui_value;
+input_gain.target_value = dB_to_amplitude(input_gain);
+output_gain.target_value = dB_to_amplitude(output_gain);
+
+@sample
+input_gain.parameter_smoothing();
+output_gain.parameter_smoothing();
+
+input_1 = spl0; input_2 = spl1;
+channel_mode == RIGHT ? input_1 = spl1 :
+channel_mode == MIX   ? input_1 = 0.5 * (spl0 + spl1);
+
+input_1 *= input_gain.smooth_value;
+do_blinking ? atomic_set(ui_sample_transfer, input_1);
+
+input_1 = transform(input_1);
+input_1 = input_1.dc_filter(input_1);
+input_1 = output_gain.smooth_value * input_1;
+spl0 = spl1 = clipper(input_1);
+
+channel_mode == STEREO ?
+(
+    input_2 *= input_gain.smooth_value;
+    input_2 = transform(input_2);
+    input_2 = input_2.dc_filter(input_2);
+    input_2 = output_gain.smooth_value * input_2;
+    spl1 = clipper(input_2);
+);
+
+//    width   height
+@gfx   860     560
+
+/////////////////////
+// MOUSE FUNCTIONS //
+/////////////////////
+
+function get_global_mouse_state()
+local(reset_targets timer last_down last_x last_y last_middle_down last_unclick)
+// Make more parameters local?
+(
+    _mouse_down = mouse_cap & 1;
+    _mouse_middle_down = mouse_cap & 64;
+    _mouse_click = _mouse_down && !last_down;
+    _mouse_middle_click = _mouse_middle_down && !last_middle_down;
+    _mouse_unclick2 = _mouse_unclick;
+    _mouse_unclick = !_mouse_down && last_down;
+    _mouse_moved = _mouse_dx || _mouse_dy;
+    _mouse_double_click = _mouse_unclick && !_mouse_moved && timer;
+    _mouse_unclick ?
+    (
+        timer = 12 * !_mouse_double_click;  // on unclick: (zero timer if doubleclick else reset timer)
+        reset_targets = 1;
+    ) :
+    reset_targets ?
+    (
+        reset_targets = 0;
+        _mouse_click_target = -1;
+    );
+    _mouse_wheel = sign(mouse_wheel);
+    _mouse_dx = mouse_x - last_x;
+    _mouse_dy = mouse_y - last_y;
+    
+    last_x = mouse_x;
+    last_y = mouse_y;
+    last_down = _mouse_down;
+    last_middle_down = _mouse_middle_down;
+    //last_unclick = _mouse_unclick
+    timer -= (timer||0);
+    mouse_wheel = 0;
+    
+    // Unused:
+    /*
+    _mouse_click ?
+    (
+        _mouse_click_x = mouse_x;
+        _mouse_click_y = mouse_y;
+    );
+    _mouse_right_down = mouse_cap & 2;
+    Ctrl  = mouse_cap & 4;
+    Shift = mouse_cap & 8;
+    Alt   = mouse_cap & 16;
+    */
+);
+
+function get_object_mouse_state(pad_left, pad_right, pad_top, pad_bottom)
+instance(x y w h mouse_id mouse_hover mouse_down mouse_click mouse_unclick mouse_middle_click)
+(
+    _mouse_click_target == -1 || _mouse_click_target == mouse_id ?
+    (
+        mouse_hover = (x - pad_left <= mouse_x) && (mouse_x <= x + w + pad_right) &&
+                       (y - pad_top <= mouse_y) && (mouse_y <= y + h + pad_bottom);
+        mouse_down = mouse_hover && _mouse_down;
+        mouse_click = mouse_down && _mouse_click;
+        mouse_middle_click = mouse_hover && _mouse_middle_click; // make more like mouse_click ?
+        mouse_unclick = _mouse_unclick && mouse_hover && mouse_id;
+        mouse_hover ? 
+        (
+            _mouse_hover_target = mouse_id;
+            mouse_click ? _mouse_click_target = mouse_id;
+        );
+    );
+    
+    hit_boxes ?
+    (
+        set_color(mouse_hover ? color__Blue_60 : color__Emerald_50);
+        gfx_rect(x-pad_left,y-pad_top,w+pad_left+pad_right,h+pad_top+pad_bottom,0);
+    );
+);
+// </MOUSE FUNCTIONS>
+
+//////////////////
+// UI FUNCTIONS //
+//////////////////
+
+function set_x(x) ( gfx_x = x; );
+function set_y(y) ( gfx_y = y; );
+function set_x_y(x, y) ( gfx_x = x; gfx_y = y; );
+function advance_x(dx) ( gfx_x += dx; ); 
+function advance_y(dy) ( gfx_y += dy; );
+function advance_x_y(dx, dy) ( gfx_x += dx; gfx_y += dy; );
+
+function smoothstep(x)
+(
+  x = clip(x, 0, 1);
+  x * x * x * (x * (x * 6 - 15) + 10);
+);
+
+
+function set_canvas(canvas, width, height)
+local(alpha)
+(
+    gfx_dest = canvas;
+    gfx_setimgdim(canvas, width, height);
+    gfx_set(0);
+    alpha = gfx_a2;
+    gfx_a2 = 0;
+    gfx_rect(0, 0, gfx_w, gfx_h);
+    gfx_a2 = alpha;
+);
+
+function get_string_width(string)
+local(w, h)
+(
+    gfx_measurestr(string, w, h);
+    w;
+);
+
+function define_font(index, font, size)
+(
+    gfx_setfont(index, font, size);
+    gfx_texth;
+);
+
+// same but with flags:
+function define_font(index, font, size, flags)
+(
+    gfx_setfont(index, font, size, flags);
+    gfx_texth;
+);
+
+function my_blit(n, x, y)
+(
+    set_x_y(x, y);
+    gfx_blit(n, 1, 0); 
+);
+
+function my_blit(source, destination, x, y, scale, rotation)
+local(temp)
+(
+    temp = gfx_dest;
+    gfx_dest = destination;
+    set_x_y(x, y);
+    gfx_blit(source, scale, rotation);
+    gfx_dest = temp;
+);
+
+function gradient(x, y, w, h, color, adj_w, adj_h)
+local(r g b)
+(
+    r = (color & 0xFF) * ONE_OVER_255;
+    g = ((color = color >> 8) & 0xFF) * ONE_OVER_255;
+    b = ((color = color >> 8) & 0xFF) * ONE_OVER_255;
+    adj_w /= w;
+    adj_h /= h;
+    gfx_gradrect(x, y, w, h, r, g, b, 1,
+                 adj_w, adj_w, adj_w, 0,
+                 adj_h, adj_h, adj_h, 0);
+);
+
+function brightness(b)
+(
+    gfx_r += b;
+    gfx_g += b;
+    gfx_b += b;
+);
+
+function gradientb(x, y, w, h, color, adj_w, adj_h, br)
+local(r g b)
+(
+    r = br + (color & 0xFF) * ONE_OVER_255;
+    g = br + ((color = color >> 8) & 0xFF) * ONE_OVER_255;
+    b = br + ((color = color >> 8) & 0xFF) * ONE_OVER_255;
+    adj_w /= w; adj_h /= h;
+    gfx_gradrect(x, y, w, h, r, g, b, 1, adj_w, adj_w, adj_w, 0, adj_h, adj_h, adj_h, 0);
+);
+
+function blur()
+local(w h)
+(
+    gfx_getimgdim(gfx_dest, w, h);
+    set_x_y(0,0);
+    gfx_blurto(w,h);
+);
+
+function generate_noise()
+local(w h brightness)
+(
+    w = gfx_w; h = gfx_h;
+    set_canvas(noise_framebuffer, gfx_w, gfx_h);
+    gfx_a = 0.7;
+    brightness = 0.1;
+    //gfx_a = 1; brightness = 1;
+    loop(gfx_y = 0; gfx_h,
+        loop(gfx_x = 0; gfx_w,
+            gfx_setpixel(rand()*brightness, rand()*brightness, rand()*brightness);
+            gfx_x += 1;
+        );
+        gfx_y += 1;
+    );
+    gfx_dest = main_framebuffer;
+);
+
+function pixelate(N)
+local(x y w h r g b _r _g _b div)
+(
+    N > 1 ?
+    (
+        w = ceil(gfx_w / N);
+        h = ceil(gfx_h / N);
+        div = 1 / (N*N);       
+        y = 0;
+        loop(h,
+            x = 0;
+            loop(w,
+                gfx_y = y;
+                r = g = b = 0;
+                loop(N,
+                    gfx_x = x;
+                    loop(N,
+                        gfx_x < gfx_w && gfx_y < gfx_h ?
+                            gfx_getpixel(_r, _g, _b);
+                        r += _r;
+                        g += _g;
+                        b += _b;
+                        gfx_x += 1;
+                    );
+                    gfx_y += 1;
+                );
+                gfx_set(r * div, g * div, b * div);
+                gfx_rect(x, y, N, N);
+                x += N;
+            );
+            y += N;
+        );
+    );
+);
+
+function initialize_parameters()
+(
+    initialize_ui_flag = 0;
+    update_switch_panel_flag = 1;
+    update_transfer_curve_flag = 1;
+    update_main_background_flag = 1;
+    
+    main_margin = 22;
+
+    // Fonts:
+    font__Cascadia = "Cascadia Code";
+    font__Calibri = "Calibri";
+    reset_enumeration();
+    system_font.enumerate();
+    title.font.enumerate();
+    Controls.font.enumerate();
+    Switches.index_font.enumerate();
+    Switches.label_font.enumerate();
+    help_text.font.enumerate();
+    Settings.font1.enumerate();
+    Settings.font2.enumerate();
+    
+    reset_enumeration();
+    main_background.framebuffer.enumerate();
+    Switches.framebuffer.enumerate();
+    Curve.grid_framebuffer.enumerate();
+    Curve.line_framebuffer.enumerate();
+    noise_framebuffer.enumerate();
+    info.framebuffer1.enumerate();
+    info.framebuffer2.enumerate();
+    main_framebuffer = -1;
+    _mouse_click_target = -1;
+    _mouse_hover_target = -1;
+
+    main_background_color = define_color(1, 89, 41);
+    
+    // Header Bar:
+    header_bar.h = 64;
+    title.text = "Bit Switch 64";
+    title.x = main_margin;
+    title.y = main_margin - 15; // -0.3 * fontsize to trim to actual text
+    title.y += 4; // aesthetic offset
+    title.h = 48;
+    gfx_setfont(title.font, font__Cascadia, title.h);
+    title.w = get_string_width(title.text);
+    
+    header_bar.h = title.y + title.h + main_margin - 9; // -0.18 * fontsize to trim to actual text
+    header_bar.h += 1; // makes Controls.vertical_spacing a round number
+    
+    Controls.horizontal_spacing = 22;
+    Controls.x = title.x + title.w + 2 * Controls.horizontal_spacing;
+    Controls.label_spacing = 4;
+    Controls.text_height = 17;
+    gfx_setfont(Controls.font, font__Calibri, Controls.text_height);
+    
+    Controls.height = Controls.text_height;
+    Controls.vertical_spacing = (header_bar.h - 2 * Controls.height) / 3;
+    Controls.inner_text_margin = 16;
+    Controls.text_color = color__Stone_20;
+    Controls.back_color = color__Stone_95;
+    Controls.border.default_color = color__Stone_50;
+    Controls.border.hover_color = color__Stone_40;
+    
+    Controls_row_1.y = Controls.vertical_spacing + 1;
+    Controls_row_2.y = Controls_row_1.y + Controls.height + Controls.vertical_spacing - 2;
+
+    gfx_setfont(Controls.font); // for string lengths
+    Controls_column_1.label_x = Controls.x;
+    Controls_column_1.label_width = get_string_width("Output");
+    Controls_column_1.control_x = Controls_column_1.label_x + Controls_column_1.label_width + Controls.label_spacing;
+    Controls_column_1.control_width = get_string_width("-55.5 dB") + Controls.inner_text_margin;
+    
+    Controls_column_2.label_x = Controls_column_1.control_x + Controls_column_1.control_width + Controls.horizontal_spacing + 10;
+    Controls_column_2.label_width = get_string_width("Channel Mode");
+    Controls_column_2.control_x = Controls_column_2.label_x + Controls_column_2.label_width + Controls.label_spacing;
+    Controls_column_2.control_width = get_string_width("Reverse") + Controls.inner_text_margin;
+    
+    Controls_column_3.label_x = Controls_column_2.control_x + Controls_column_2.control_width + Controls.horizontal_spacing;
+    Controls_column_3.label_width = get_string_width("Two's Complement");
+    Controls_column_3.control_x = Controls_column_3.label_x + Controls_column_3.label_width + Controls.label_spacing;
+    Controls_column_3.control_width = get_string_width("Floating Point") + Controls.inner_text_margin;
+    
+    link_control.x1 = Controls_column_1.control_x + Controls_column_1.control_width;
+    link_control.y1 = Controls_row_1.y + 0.5 * Controls.height;
+    link_control.x2 = link_control.x1 + 10;
+    link_control.y2 = Controls_row_2.y + 0.5 * Controls.height;
+    
+    link_control.w = 11; // keep this odd
+    link_control.h = link_control.w;
+    link_control.x = link_control.x2 - 0.5 * (link_control.w - 1);
+    link_control.y = 0.5 * (link_control.y1 + link_control.y2 - link_control.w + 1);
+    link_control.y3 = link_control.y;
+    link_control.y4 = link_control.y3 + link_control.h;
+    
+    input_control.x = Controls_column_1.control_x;
+    input_control.y = Controls_row_1.y;
+    input_control.w = Controls_column_1.control_width;
+    input_control.h = Controls.height;
+    input_control.control_x = Controls_column_1.control_x;
+    input_control.control_width = Controls_column_1.control_width;
+    input_control.label_x = Controls_column_1.label_x;
+    input_control.label_width = Controls_column_1.label_width;
+    input_control.label = "Input";
+    
+    output_control.x = Controls_column_1.control_x;
+    output_control.y = Controls_row_2.y;
+    output_control.w = Controls_column_1.control_width;
+    output_control.h = Controls.height;
+    output_control.control_x = Controls_column_1.control_x;
+    output_control.control_width = Controls_column_1.control_width;
+    output_control.label_x = Controls_column_1.label_x;
+    output_control.label_width = Controls_column_1.label_width;
+    output_control.label = "Output";
+    
+    switch_mode_control.x = Controls_column_2.control_x;
+    switch_mode_control.y = Controls_row_1.y;
+    switch_mode_control.w = Controls_column_2.control_width;
+    switch_mode_control.h = Controls.height;
+    switch_mode_control.control_x = Controls_column_2.control_x;
+    switch_mode_control.control_width = Controls_column_2.control_width;
+    switch_mode_control.label_x = Controls_column_2.label_x;
+    switch_mode_control.label_width = Controls_column_2.label_width;
+    switch_mode_control.label = "Switch Mode";
+    
+    channel_mode_control.x = Controls_column_2.control_x;
+    channel_mode_control.y = Controls_row_2.y;
+    channel_mode_control.w = Controls_column_2.control_width;
+    channel_mode_control.h = Controls.height;
+    channel_mode_control.control_x = Controls_column_2.control_x;
+    channel_mode_control.control_width = Controls_column_2.control_width;
+    channel_mode_control.label_x = Controls_column_2.label_x;
+    channel_mode_control.label_width = Controls_column_2.label_width;
+    channel_mode_control.label = "Channel Mode";
+    
+    representation_control.x = Controls_column_3.control_x;
+    representation_control.y = Controls_row_1.y;
+    representation_control.w = Controls_column_3.control_width;
+    representation_control.h = Controls.height;
+    representation_control.control_x = Controls_column_3.control_x;
+    representation_control.control_width = Controls_column_3.control_width;
+    representation_control.label_x = Controls_column_3.label_x;
+    representation_control.label_width = Controls_column_3.label_width;
+    representation_control.label = "Representation";
+    
+    twos_complement_control.x = Controls_column_3.control_x;
+    twos_complement_control.y = Controls_row_2.y;
+    twos_complement_control.w = Controls_column_3.control_width;
+    twos_complement_control.h = Controls.height;
+    twos_complement_control.control_x = Controls_column_3.control_x;
+    twos_complement_control.control_width = Controls_column_3.control_width;
+    twos_complement_control.label_x = Controls_column_3.label_x;
+    twos_complement_control.label_width = Controls_column_3.label_width;
+    twos_complement_control.label = "Two's Complement";
+    // function SETTINGS()
+    
+    info.margin = 50;
+    info.color = color__Stone_60;
+    info.w = gfx_w - 2*info.margin;
+    info.h = gfx_h - 2*info.margin;
+    info.blur = 5;
+    info.alpha = 0.7;
+    info.text_color = color__Neutral_20;
+    info.font = 10;
+    info.text_height = 26;
+    gfx_setfont(info.font, font__Calibri, info.text_height);
+    info.dim = 0.4;
+    info.pixels = 16;
+    info.t1.timer_set(10); // 10,20,10
+    info.t2.timer_set(20);
+    info.t3.timer_set(10);
+    
+    Settings.margin = 16;
+    Settings.row_height = 30;
+    Settings.horizontal_spacing = 22;
+    Settings.label_spacing = 10;
+    Settings.text_height = 20;
+    gfx_setfont(Settings.font1, font__Calibri, Settings.text_height);
+    gfx_setfont(Settings.font2, font__Calibri, Settings.text_height + 6, 'bu');
+    Settings.control_height = Settings.text_height + 2;
+    Settings.row_height = Settings.control_height + 10;
+    Settings.inner_text_margin = 16;
+    Settings.text_color = color__Stone_20;
+    Settings.back_color = color__Stone_95;
+    Settings.border.default_color = color__Stone_50;
+    Settings.border.hover_color = color__Stone_40;
+    
+    Settings_row_1.y = info.margin + Settings.margin;
+    Settings_row_2.y = Settings_row_1.y + Settings.row_height + 6;
+    Settings_row_3.y = Settings_row_2.y + Settings.row_height;
+    Settings_row_4.y = Settings_row_3.y + Settings.row_height;
+    Settings_row_5.y = Settings_row_4.y + Settings.row_height;
+
+    gfx_setfont(Settings.font1); // for string lengths
+    Settings_column_1.label_x = info.margin + Settings.margin;
+    Settings_column_1.label_width = get_string_width("Bit Numbering");
+    Settings_column_1.control_x = Settings_column_1.label_x + Settings_column_1.label_width + Settings.label_spacing;
+    Settings_column_1.control_width = get_string_width("63-0") + Settings.inner_text_margin;
+
+    numbering_setting.x = Settings_column_1.control_x;
+    numbering_setting.y = Settings_row_2.y;
+    numbering_setting.w = Settings_column_1.control_width;
+    numbering_setting.h = Settings.control_height;
+    numbering_setting.control_x = Settings_column_1.control_x;
+    numbering_setting.control_width = Settings_column_1.control_width;
+    numbering_setting.label_x = Settings_column_1.label_x;
+    numbering_setting.label_width = Settings_column_1.label_width;
+    numbering_setting.label = "Bit Numbering";
+
+    blinking_setting.x = Settings_column_1.control_x;
+    blinking_setting.y = Settings_row_3.y;
+    blinking_setting.w = Settings_column_1.control_width;
+    blinking_setting.h = Settings.control_height;
+    blinking_setting.control_x = Settings_column_1.control_x;
+    blinking_setting.control_width = Settings_column_1.control_width;
+    blinking_setting.label_x = Settings_column_1.label_x;
+    blinking_setting.label_width = Settings_column_1.label_width;
+    blinking_setting.label = "Blinking Bits";
+
+    dc_setting.x = Settings_column_1.control_x;
+    dc_setting.y = Settings_row_4.y;
+    dc_setting.w = Settings_column_1.control_width;
+    dc_setting.h = Settings.control_height;
+    dc_setting.control_x = Settings_column_1.control_x;
+    dc_setting.control_width = Settings_column_1.control_width;
+    dc_setting.label_x = Settings_column_1.label_x;
+    dc_setting.label_width = Settings_column_1.label_width;
+    dc_setting.label = "Block DC";
+    
+    clip_setting.x = Settings_column_1.control_x;
+    clip_setting.y = Settings_row_5.y;
+    clip_setting.w = Settings_column_1.control_width;
+    clip_setting.h = Settings.control_height;
+    clip_setting.control_x = Settings_column_1.control_x;
+    clip_setting.control_width = Settings_column_1.control_width;
+    clip_setting.label_x = Settings_column_1.label_x;
+    clip_setting.label_width = Settings_column_1.label_width;
+    clip_setting.label = "Clip at 0dB";
+
+    Curve.x = main_margin;
+    Curve.y = header_bar.h + main_margin;
+    Curve.size1 = 256;
+    Curve.size1 = 512;
+    Curve.size = 336;
+    Curve.scale = Curve.size / Curve.size1;
+    
+    Curve.background.color = define_color(87, 87, 62);
+    Curve.border = 3;
+    Curve.grid_division = POWER_03;
+    Curve.array = 100;
+    
+    
+    Switches.index_height = 17;
+    gfx_setfont(Switches.index_font, font__Cascadia, Switches.index_height);
+    Switches.label_height = 14;
+    gfx_setfont(Switches.label_font, font__Cascadia, Switches.label_height);
+    switch.color = color__Neutral_40;
+    Switches.switch_width = 15;
+    Switches.switch_height = 2 * Switches.switch_width - 3;
+    Switches.column_width = Switches.switch_width + 9;
+    Switches.row_height = Switches.switch_height + Switches.index_height + 12;
+    Switches.x = Curve.x + Curve.size + 2 * Curve.border + main_margin;
+    Switches.y = Curve.y;
+    Switches.margin = 16;
+    
+    gfx_setfont(Controls.font);
+    clear_all_button.label = "Clear All";
+    clear_all_button.w = get_string_width(clear_all_button.label) + Controls.inner_text_margin;
+    clear_all_button.h = Controls.height + 2;
+    
+    set_all_button.label = "Set All";
+    set_all_button.w = get_string_width(set_all_button.label) + Controls.inner_text_margin;
+    set_all_button.h = Controls.height + 2;
+    
+    reset_mapping_button.label = "Reset Mapping";
+    reset_mapping_button.w = get_string_width(reset_mapping_button.label) + Controls.inner_text_margin;
+    reset_mapping_button.h = Controls.height + 2;
+    
+    <?
+        loop(i = 0; 64,
+            printf("switch_%02d.w = Switches.switch_width;", i);
+            printf("switch_%02d.h = Switches.switch_height;", i);
+            printf("switch_%02d.n = %d;", i, i);
+            printf("switch_%02d.m = %d;", i, i);
+            printf("switch_%02d.power = 2^%d;", i, i % 32);
+            printf("switch_%02d.map = %f;", i, 2^i);
+        i += 1);
+    ?>
+    
+    // mouse_id's:
+    reset_enumeration(1);
+    title.mouse_id.enumerate();
+    link_control.mouse_id.enumerate();
+    input_control.mouse_id.enumerate();
+    output_control.mouse_id.enumerate();
+    switch_mode_control.mouse_id.enumerate();
+    channel_mode_control.mouse_id.enumerate();
+    representation_control.mouse_id.enumerate();
+    twos_complement_control.mouse_id.enumerate();
+    
+    clear_all_button.mouse_id.enumerate();
+    set_all_button.mouse_id.enumerate();
+    reset_mapping_button.mouse_id.enumerate();
+    
+    Switches.mouse_id.enumerate();
+    <? loop(i = 0; 64, printf("switch_%02d.mouse_id = Switches.mouse_id;", i); i += 1); ?>
+    
+    numbering_setting.mouse_id.enumerate();
+    blinking_setting.mouse_id.enumerate();
+    dc_setting.mouse_id.enumerate();
+    clip_setting.mouse_id.enumerate();
+    
+    footer_bar.h = header_bar.h;
+    footer_bar.y = Curve.y + Curve.size + 2 * Curve.border + 1.6 * main_margin;
+    footer_bar.top_margin = 8;
+    help_text.color = color__Stone_30;
+    help_text.text_height = 22;
+    gfx_setfont(help_text.font, font__Calibri, help_text.text_height, 'b');
+    
+strcpy(title.mouse_id, "More info! Hidden settings! Click now!");
+
+strcpy(link_control.mouse_id,
+"Link input and output controls. Note that when enabling, both controls will be reset to unity gain."
+);
+
+strcpy(input_control.mouse_id,
+"INPUT: Drag or scroll to set the incoming signal level. Double-click to reset.");
+strcpy(output_control.mouse_id,
+"OUTPUT: Drag or scroll to set the gain applied to the output after all processing. Double-click to reset.");
+
+strcpy(channel_mode_control.mouse_id,
+"CHANNEL MODE: Save the planet (and your CPU) by processing one channel instead of two!");
+strcpy(switch_mode_control.mouse_id,
+"SWITCH MODE: BREAK - Set bits (switch up) will transmit a constant 0.
+SWITCH MODE: JAM - Set bits will transmit a constant 1.
+SWITCH MODE: REVERSE - Set bits will be inverted.");
+
+strcpy(representation_control.mouse_id,
+"REPRESENTATION: Choose how sample values will be represented. Please note that for your safety when
+switching representation, all switches will be cleared (toggled off/down) and all mappings will be reset.");
+strcpy(twos_complement_control.mouse_id,
+"TWO'S COMPLEMENT: This is how your computer represents negative values. Disable this if you'd rather just
+pretend all samples are positive, effectively adding 6dB of headroom and making the waveshaping symmetrical.");
+
+strcpy(Switches.mouse_id,
+"SWITCHES: Click to toggle or click & drag to toggle multiple switches at once.
+MAPPING: Scroll to remap a bit or middle-click to reset mapping.
+Remapping bit x to bit y will transmit the signal from bit x through bit y instead (y = x & y).
+");
+strcpy(clear_all_button.mouse_id, "Click to toggle all switches off (down).");
+strcpy(set_all_button.mouse_id, "Click to toggle all switches on (up).");
+strcpy(reset_mapping_button.mouse_id, "Click to reset all mappings.");
+
+    generate_noise();
+);
+
+
+function update_switch_panel()
+local(x y i)
+(
+    update_switch_panel_flag = 0;
+    representation == FIXED ?
+    (
+        x = Switches.x + Switches.margin;
+        y = Switches.y + Switches.margin + Switches.label_height - 3;
+        
+        <?
+            loop(i = 63; 64,
+                printf("switch_%02d.x = x; switch_%02d.y = y;", i, i);
+                !(i % 16) ? (
+                    printf("x = Switches.x + Switches.margin;");
+                    printf("y += Switches.row_height;");
+                ) : printf("x += Switches.column_width;");
+            i -= 1 );
+        ?>
+        
+        Switches.w = switch_00.x - Switches.x + Switches.switch_width + Switches.margin;
+        Switches.h = switch_00.y - Switches.y + Switches.switch_height + Switches.label_height + Switches.margin;
+        
+        clear_all_button.x = Switches.x;
+        clear_all_button.y = Switches.y + Switches.h - 1;
+        
+        set_all_button.x = clear_all_button.x + clear_all_button.w - 1;
+        set_all_button.y = clear_all_button.y;
+        
+        reset_mapping_button.x = set_all_button.x + set_all_button.w - 1;
+        reset_mapping_button.y = set_all_button.y;
+        
+    ) : // representation == FLOAT ?
+    (
+        x = Switches.x + Switches.margin;
+        y = Switches.y + Switches.margin + Switches.label_height - 3;
+        
+        switch_63.x = x;
+        switch_63.y = y;
+        x += Switches.column_width;
+        <?
+            loop(i = 62; 11,
+                printf("x += Switches.column_width;");
+                printf("switch_%02d.x = x; switch_%02d.y = y;", i, i);
+            i -= 1);
+            printf("x = Switches.x + Switches.margin;");
+            printf("y += Switches.label_height + 1.1 * Switches.row_height;");
+            loop(52,
+                printf("switch_%02d.x = x; switch_%02d.y = y;", i, i);
+                !(i % 13) ? (
+                    printf("x = Switches.x + Switches.margin;");
+                    printf("y += Switches.row_height;");
+                ) : printf("x += Switches.column_width;");
+            i -= 1);
+        ?>
+        
+        Switches.w = switch_00.x - Switches.x + Switches.switch_width + Switches.margin;
+        Switches.h = switch_00.y - Switches.y + Switches.switch_height + Switches.label_height + Switches.margin;
+        
+        clear_all_button.x = Switches.x;
+        clear_all_button.y = Switches.y + Switches.h - 1;
+        
+        set_all_button.x = clear_all_button.x + clear_all_button.w - 1;
+        set_all_button.y = clear_all_button.y;
+        
+        reset_mapping_button.x = set_all_button.x + set_all_button.w - 1;
+        reset_mapping_button.y = set_all_button.y;
+    );
+    
+    switches.upper_bits = 0;
+    switches.lower_bits = 0;
+    <?
+        loop(i = 0; j = 1; 64,
+            printf("switch_%02d.status = 0;", i);
+            printf("switch_%02d.m = %d;", i, i);
+            printf("switch_%02d.map = %f;", i, j);
+        i += 1; j *= 2);
+    ?>
+ );
+ 
+function update_main_background()
+(
+    update_main_background_flag = 0;
+    
+      // Predraw Transfer Curve Background:
+      set_canvas(Curve.grid_framebuffer, Curve.size, Curve.size);
+      // Back:
+      Curve.background.color = define_color(aa_r,aa_g,aa_b);
+      Curve.background.color = color__Sky_90;
+      //gradient(0, 0, Curve.size, Curve.size, Curve.background.color, aa_dx, aa_dy);
+      //gradientb(0, 0, Curve.size, Curve.size, Curve.background.color, aa_dx, aa_dy, aa_br);
+      set_color(Curve.background.color);
+      gfx_rect(0, 0, Curve.size, Curve.size);
+      // Grid:
+      set_color(color__Neutral_80, 0.4);
+      loop(j = 1; Curve.grid_division - 1,
+          k = floor(Curve.size * j / Curve.grid_division);
+          gfx_line(0, k, Curve.size - 1, k); //horizontal
+          gfx_line(k, 0, k, Curve.size - 1); //vertical
+          j += 1;
+      );
+      // Unity Line:
+      gfx_a = 0.5;
+      gfx_line(0, Curve.size - 1, Curve.size - 1, 0);
+      // Center Gridlines:
+      gfx_a = 1;
+      k = floor(0.5 * Curve.size);
+      gfx_line(0, k, Curve.size - 1, k); //horizontal
+      gfx_line(k, 0, k, Curve.size - 1); //vertical
+    
+    set_canvas(main_background.framebuffer, gfx_w, gfx_h);
+    // Main Green Background Gradient:
+    gradient(0, header_bar.h, gfx_w, gfx_h, main_background_color, -0.05, -0.08);
+    // Header Bar Background:
+    gradient(0, 0, gfx_w, header_bar.h, color__Stone_80, 0, -0.05);
+    
+    // Transfer Curve Border:
+    set_color(color__Stone_95);
+    gfx_rect(Curve.x, Curve.y, Curve.size + 2 * Curve.border,  Curve.size + 2 * Curve.border);
+    // Transfer Curve "LCD Screen":
+    my_blit(Curve.grid_framebuffer, Curve.x + Curve.border, Curve.y + Curve.border);
+    
+    // Footer Bar Background:
+    set_color(color__Stone_90);
+    gfx_rect(0, footer_bar.y, gfx_w, gfx_h - footer_bar.y + 1);
+    
+    // Switch Panel Back:
+    gradient(Switches.x, Switches.y, Switches.w, Switches.h, color__Cyan_95, -0.01, -0.04);
+    // Switch Panel Border:
+    set_color(switch.color);
+    gfx_rect(Switches.x, Switches.y, Switches.w, Switches.h, 0);
+    // Switch Panel Labels:
+    set_x_y(Switches.x + Switches.margin - 2, Switches.y + Switches.margin - 7);
+    gfx_setfont(Switches.label_font);
+    set_color(switch.color);
+    representation == FIXED ?
+    (
+        gfx_printf("MSB");
+    ) :
+    // representation == FLOAT ?
+    (
+        gfx_printf("SIGN");
+        set_x_y(Switches.x + Switches.margin + 2 * Switches.column_width - 2,  Switches.y + Switches.margin - 7);
+        gfx_printf("EXPONENT");
+        set_x_y(Switches.x + Switches.margin - 2, Switches.y + Switches.margin + 1.1 * Switches.row_height + Switches.label_height - 7);
+        gfx_printf("MANTISA");
+    );
+);
+ 
+function draw_control()
+instance(label_x label_width control_x control_width y h label value_string mouse_hover mouse_id)
+(
+    this.get_object_mouse_state(1,1,1,1);
+    // Label
+    set_x_y(label_x, y); set_color(Controls.text_color);
+    gfx_drawstr(label, 2, label_x + label_width, gfx_h);
+    // Back
+    set_color(Controls.back_color);
+    gfx_rect(control_x, y, control_width, h, 1);
+    // Border:
+    set_color(mouse_hover || mouse_id == _mouse_click_target ? Controls.border.hover_color : Controls.border.default_color);
+    gfx_rect(control_x, y, control_width, h, 0);
+    // Value:
+    set_x_y(control_x, y); set_color(Controls.text_color);
+    gfx_drawstr(value_string, 1, control_x + control_width, y + h);
+);
+ 
+function update_transfer_curve()
+local(i k)
+(
+    update_transfer_curve_flag = 0;
+    set_canvas(Curve.line_framebuffer, Curve.size1, Curve.size1);
+    // get curve values:
+    loop(i = 0; Curve.size1,
+        k = (2 * i - Curve.size1) / Curve.size1; // 256 linearly spaced values between -1 and 1
+        k *= input_gain.target_value;
+        k = transform(k);
+        k *= output_gain.target_value;
+        do_clipping ? k = clip(k, 1);
+        k = 1 - k; // map to values between 2 and 0
+        k = 0.5 * Curve.size1 * k - 1; // Scale up values to display size
+        do_clipping ? k = max(k, 0);
+        Curve.array[i] = k + 0.5;
+    i += 1 );
+    // Blurry line:
+    set_x_y(0, Curve.array[0]);
+    //set_color(color__Amber_10, 0.6);
+    set_color(color__Sky_20, 1);
+    loop(i = 1; Curve.size1 - 1, gfx_lineto(gfx_x + 1, Curve.array[i]); i += 1 );
+    loop(7, blur());
+    // Sharp line:
+    set_color(color__Amber_05, 1);
+    set_color(color__Sky_30, 1);
+    set_x_y(0, Curve.array[0]); 
+    loop(i = 1; Curve.size1 - 1, gfx_lineto(gfx_x + 1, Curve.array[i], 1); i += 1 );
+);
+ 
+ function draw_switch()
+ instance(x y w h n m power status map mouse_hover mouse_click mouse_down mouse_id mouse_middle_click blink)
+ local(y_offset index)
+ (
+    this.get_object_mouse_state(4,4,7,21);
+    mouse_hover ?
+    (
+        gfx_setcursor(32515);
+        _mouse_hover_target = Switches.mouse_id;
+    );
+    mouse_click ?
+    (
+        status = !status;
+        (n > 31 ? switches.upper_bits : switches.lower_bits) ~= power;
+        switching_direction = status;
+        update_transfer_curve_flag = 1;
+    ) :
+    mouse_down && status != switching_direction ?
+    (
+        status = switching_direction;
+        (n > 31 ? switches.upper_bits : switches.lower_bits) ~= power;
+        update_transfer_curve_flag = 1;
+    ) :
+    mouse_hover && _mouse_wheel > 0 && m < 63 ?
+    (
+        m += 1; map *= 2; 
+        update_transfer_curve_flag = 1;
+    ) :
+    mouse_hover && _mouse_wheel < 0 && m > 0 ?
+    (
+        m -= 1; map *= 0.5;
+        update_transfer_curve_flag = 1;
+    ) :
+    mouse_middle_click && m != n ?
+    (
+        m = n; map = 2^n;
+        update_transfer_curve_flag = 1;
+    );
+    // Back:
+    set_color(color__Gray_95, 1);
+    gfx_rect(x, y, w, h);
+    
+      set_color(color__Neutral_95);
+      gfx_roundrect(x-1, y-1, w+1, h+1, 2);
+    
+    // Actuator (back):
+    set_color(color__Neutral_60);
+    y_offset = status ? 2 : h - w + 2;
+    gfx_rect(x + 2, y + y_offset, w - 4, w - 4, 1);
+    
+    set_color(mouse_hover ? color__Neutral_05 : switch.color);
+    // Border:
+    gfx_rect(x, y, w, h, 0);
+    // Actuator (front):
+    gfx_rect(x + 2, y + y_offset, w - 5, w - 5, 1);
+    
+    // Bit/Map Index:
+    gfx_setfont(Switches.index_font);
+    index =
+      numbering == 0 ? m :
+      numbering == 1 ? 63 - m :
+      numbering == 2 ? m + 1 :
+      numbering == 3 ? 64 - m;
+    do_blinking ?
+    (
+        (n > 31 ? ui_sample.upper_bits : ui_sample.lower_bits) & power ? blink = 1 : blink *= 0.7;
+        blink == 0 ? blink = 0;
+        !mouse_hover && blink > 0 ? 
+        (
+            set_color(color__Neutral_95, blink);
+            set_x_y(x, y + h + 3);
+            gfx_drawstr(sprintf(#, "%02d", index),1, x + w + 3, gfx_h);
+            set_color_blend(switch.color, color__Amber_05, blink);
+        );
+    );
+    set_x_y(x, y + h + 1);
+    gfx_drawstr(sprintf(#, "%02d", index),1, x + w, gfx_h);
+    // Mapping Arrow:
+    n != m ?
+    (
+        advance_y(18);
+        gfx_line(x+1,gfx_y, x+w-2,gfx_y);
+        n < m ?
+        (
+            gfx_line(x+2,gfx_y-1, x+2,gfx_y+1);
+            gfx_line(x+3,gfx_y-2, x+3,gfx_y+2);
+        ) :
+        (
+            gfx_line(x+w-3,gfx_y-1, x+w-3,gfx_y+1);
+            gfx_line(x+w-4,gfx_y-2, x+w-4,gfx_y+2);
+        );
+    );
+);
+ 
+function draw_button()
+instance(x y w h label mouse_hover mouse_down)
+(
+    this.get_object_mouse_state(1,1,1,1);
+    // Back:
+    set_color(color__Cyan_95); gfx_rect(x, y, w, h, 1);
+    // Border:
+    set_color(switch.color);   gfx_rect(x, y, w, h, 0);
+    // Label:
+    set_x_y(x, y);
+    gfx_setfont(Controls.font);
+    mouse_down ?
+    (
+        set_color(color__Neutral_05);  gfx_drawstr(label, 5, x + w + 2, y + h);
+    ) :
+    mouse_hover ?
+    (
+        set_color(color__Neutral_95);  gfx_drawstr(label, 5, x + w + 2, y + h);
+        set_x_y(x, y);
+        set_color(color__Neutral_10);  gfx_drawstr(label, 5, x + w, y + h - 2);
+    ) : 
+    (
+        set_color(color__Neutral_30);  gfx_drawstr(label, 5, x + w, y + h - 2);
+    );
+);
+ 
+function draw_setting(alpha)
+instance(label_x label_width control_x control_width y h label value_string mouse_hover mouse_id)
+(
+    this.get_object_mouse_state(1,1,1,1);
+    // Label
+    set_x_y(label_x, y); set_color(Settings.text_color, alpha);
+    gfx_drawstr(label, 0);
+    // Back
+    set_color(Settings.back_color);
+    gfx_rect(control_x, y, control_width, h, 1);
+    // Border:
+    set_color(mouse_hover || mouse_id == _mouse_click_target ? Settings.border.hover_color : Settings.border.default_color);
+    gfx_rect(control_x, y, control_width, h, 0);
+    // Value:
+    set_x_y(control_x, y-1); set_color(Settings.text_color);
+    gfx_drawstr(value_string, 5, control_x + control_width, y + h);
+);
+ 
+function draw_title()
+instance(#str1 #str2)
+(
+    title.get_object_mouse_state(4, 4, -2, 2);
+    gfx_setfont(title.font);
+    #str1 = title.text;
+    rand() < 0.08 ? strcpy(#str2, "Bit  witch 64") : strcpy(#str2, #str1);
+    title.mouse_down ?
+    (
+        set_x_y(title.x + 2, title.y + 2); set_color(color__Stone_50); gfx_drawstr(#str1);
+        set_x_y(title.x + 1, title.y + 1); set_color(color__Black); gfx_drawstr(#str2);
+        set_x_y(title.x, title.y); set_color(color__White); gfx_drawstr(#str1);
+    ) :
+    title.mouse_hover ?
+    (
+        set_x_y(title.x + 2, title.y + 2);  set_color(color__Stone_40); gfx_drawstr(#str1);
+        set_x_y(title.x + 1, title.y + 1);  set_color(color__Black); gfx_drawstr(#str2);
+        set_x_y(title.x - 1, title.y - 1);  set_color(color__White); gfx_drawstr(#str1);
+        _mouse_unclick2 ? info_screen_flag = 1;
+    ) :
+    (
+        set_x_y(title.x, title.y); set_color(color__Stone_10); gfx_drawstr(#str1);
+    );
+);
+
+function draw_info_screen()
+local(t, q, _t)
+(
+    info.p1 ?
+    (
+        info.p2 = info.t1.timer_tick();
+        info.p1 = !info.p2;
+        _t = info.t1.phase;
+        t = smoothstep(info.t1.phase);
+        //t = _t;
+        my_blit(info.framebuffer1, 0, 0);
+        q = 1 - t * info.dim;
+        gfx_muladdrect(0, 0, gfx_w, gfx_h, q, q, q);
+        pixelate(floor(_t * info.pixels));
+        set_color(info.color, t * info.alpha);
+        gfx_rect(info.margin, info.margin, t * info.w , t * info.h);
+        set_color(color__Black, t);
+        gfx_rect(info.margin, info.margin, t * info.w , t * info.h, 0);
+        info.p2 ?
+        (
+            set_canvas(info.framebuffer2, gfx_w, gfx_h);
+            my_blit(MAIN_FRAMEBUFFER,0,0);
+        );
+    ) :
+    info.p2 ?
+    (
+        my_blit(info.framebuffer2, 0, 0);
+        _mouse_click_target == -1 && _mouse_unclick ? (info.p2 = 0; info.p3 = 1);
+        
+        info.t2.timer_tick();
+        t = smoothstep(info.t2.phase);
+        
+// function SETTINGS()
+        set_color(info.text_color, t);
+        gfx_setfont(Settings.font2);
+        set_x_y(Settings_column_1.label_x, Settings_row_1.y);
+        gfx_drawstr("Settings:");
+        
+        gfx_setfont(Settings.font1);
+        
+        // Bit Numbering Menu:
+        numbering_setting.value_string = 
+            numbering == 0 ? "63-0" :
+            numbering == 1 ? "0-63" :
+            numbering == 2 ? "64-1" :
+            numbering == 3 ? "1-64";
+        numbering_setting.draw_setting(t);
+        numbering_setting.mouse_click ? numbering_setting.show_menu = 1;
+        numbering_setting.show_menu ?
+        (
+            set_x_y(numbering_setting.control_x, numbering_setting.y + numbering_setting.h);
+            menu = gfx_showmenu
+            (
+                numbering == 0 ? "!MSB=63, LSB=0|MSB=0, LSB=63|MSB=64, LSB=1|MSB=1, LSB=64" :
+                numbering == 1 ? "MSB=63, LSB=0|!MSB=0, LSB=63|MSB=64, LSB=1|MSB=1, LSB=64" :
+                numbering == 2 ? "MSB=63, LSB=0|MSB=0, LSB=63|!MSB=64, LSB=1|MSB=1, LSB=64" :
+                numbering == 3 ? "MSB=63, LSB=0|MSB=0, LSB=63|MSB=64, LSB=1|!MSB=1, LSB=64";
+            );
+            menu ?
+            (
+                numbering_setting.show_menu = 0;
+                numbering = menu - 1;
+            ) :
+            (
+                _mouse_click ? numbering_setting.show_menu = 0;
+            );
+        ) :
+        numbering_setting.mouse_hover && _mouse_wheel ?
+        (
+            numbering = clip(numbering - _mouse_wheel, 0, 3);
+        );
+        
+        // Blinking Menu:
+        blinking_setting.value_string = do_blinking ? "On" : "Off";
+        blinking_setting.draw_setting(t);
+        blinking_setting.mouse_click ? do_blinking = !do_blinking;
+        
+        // DC Menu:
+        dc_setting.value_string = do_dc_filter ? "On" : "Off";
+        dc_setting.draw_setting(t);
+        dc_setting.mouse_click ? do_dc_filter = !do_dc_filter;
+        
+        // Clip Menu:
+        clip_setting.value_string = do_clipping ? "On" : "Off";
+        clip_setting.draw_setting(t);
+        clip_setting.mouse_click ? do_clipping = !do_clipping;
+    ) :
+    info.p3 ?
+    (
+        info.p3 = !info.t3.timer_tick();
+        _t = 1 - info.t3.phase;
+        t = smoothstep(_t);
+        my_blit(info.framebuffer1, 0, 0);
+        pixelate(floor(_t * info.pixels));
+        q = 1 - info.dim * t;
+        gfx_muladdrect(0, 0, gfx_w, gfx_h, q, q, q);
+        set_color(info.color, t * info.alpha);
+        gfx_rect(info.margin, info.margin, t * info.w , t * info.h);
+        set_color(color__Black, t);
+        gfx_rect(info.margin, info.margin, t * info.w , t * info.h, 0);
+    ) : info_screen_flag = 0;
+);
+
+function draw_Controls()
+(
+    gfx_setfont(Controls.font);
+    // IO Link:
+    link_control.get_object_mouse_state(2,2,5,5);
+    set_color(Controls.border.default_color);
+    link_control.mouse_hover ? set_color(Controls.border.hover_color);
+    gfx_line(link_control.x1,link_control.y1, link_control.x2,link_control.y1);
+    gfx_line(link_control.x1,link_control.y2, link_control.x2,link_control.y2);
+    gfx_line(link_control.x2,link_control.y1, link_control.x2,link_control.y3);
+    gfx_line(link_control.x2,link_control.y2, link_control.x2,link_control.y4);
+    gfx_rect(link_control.x,link_control.y, link_control.w, link_control.h, 0);
+    do_link ? gfx_rect(link_control.x+2,link_control.y+2, link_control.w-4, link_control.h-4);
+    link_control.mouse_unclick ?
+    (
+        !do_link ?
+        (
+            do_link = 1;
+            input_gain.ui_value = 0;
+            output_gain.ui_value = 0;
+            update_levels = 1;
+        ) : do_link = 0;
+    );
+    // Input Slider:
+    input_control.value_string = sprintf(#, "%.1f dB", input_gain.ui_value);
+    input_control.draw_control();
+    input_control.mouse_hover && _mouse_wheel ?
+    (
+        input_gain.ui_value = clip(input_gain.ui_value + _mouse_wheel, 24);
+        update_levels = 1;
+    ) :
+    _mouse_click_target == input_control.mouse_id ?
+    (
+        input_gain.ui_value = clip(input_gain.ui_value - 0.1 * _mouse_dy, 24);
+        _mouse_double_click ? input_gain.ui_value = 0;
+        update_levels = 1;
+    );
+    // Output Slider:
+    output_control.value_string = sprintf(#, "%.1f dB", output_gain.ui_value);
+    output_control.draw_control();
+    output_control.mouse_hover && _mouse_wheel ?
+    (
+        output_gain.ui_value = clip(output_gain.ui_value + _mouse_wheel, 24);
+        update_levels = 1;
+    ) :
+    _mouse_click_target == output_control.mouse_id ?
+    (
+        output_gain.ui_value = clip(output_gain.ui_value - 0.1 * _mouse_dy, 24);
+        _mouse_double_click ? output_gain.ui_value = 0;
+        update_levels = 1;
+    );
+    do_link ?
+    (
+    // need to handle scroll as well
+        _mouse_click_target == input_control.mouse_id ||
+        (_mouse_hover_target == input_control.mouse_id && _mouse_wheel) ?
+        (
+            output_gain.ui_value = -input_gain.ui_value;
+            !output_gain.ui_value ? output_gain.ui_value = 0;
+        )
+        : _mouse_click_target == output_control.mouse_id ||
+        (_mouse_hover_target == output_control.mouse_id && _mouse_wheel) ?
+        (
+            input_gain.ui_value = -output_gain.ui_value;
+            !input_gain.ui_value ? input_gain.ui_value = 0;
+        );
+    );
+    update_levels ?
+    (
+        update_levels = 0;
+        update_transfer_curve_flag = 1;
+        input_gain = input_gain.ui_value;
+        output_gain = output_gain.ui_value;
+        input_gain.target_value = dB_to_amplitude(input_gain);
+        output_gain.target_value = dB_to_amplitude(output_gain);
+    );
+    // Switch Mode Menu:
+    switch_mode_control.value_string = switch_mode == BREAK ? "Break" : switch_mode == JAM ? "Jam" : "Reverse";
+    switch_mode_control.draw_control();
+    switch_mode_control.mouse_click ? switch_mode_control.show_menu = 1;  
+    switch_mode_control.show_menu ?
+    (
+        set_x_y(switch_mode_control.control_x, switch_mode_control.y + switch_mode_control.h);
+        menu = gfx_showmenu
+        (
+            switch_mode == BREAK ? "!Break|Jam|Reverse" :
+            switch_mode == JAM ? "Break|!Jam|Reverse" :
+            switch_mode == REVERSE ? "Break|Jam|!Reverse";
+        );
+        menu ?
+        (
+            switch_mode_control.show_menu = 0;
+            switch_mode = menu - 1;
+            update_transfer_curve_flag = 1;
+        ) :
+        _mouse_click ?
+        (
+            switch_mode_control.show_menu = 0;
+        );
+    ) :
+    switch_mode_control.mouse_hover && _mouse_wheel ?
+    (
+        switch_mode = clip(switch_mode - _mouse_wheel, 0, 2);
+        update_transfer_curve_flag = 1;
+    );
+    // Channel Mode Menu:
+    channel_mode_control.value_string = 
+        channel_mode == STEREO ? "Stereo" :
+        channel_mode == LEFT ? "Left" :
+        channel_mode == RIGHT ? "Right" :
+        channel_mode == MIX ? "Mix";
+    channel_mode_control.draw_control();
+    channel_mode_control.mouse_click ? channel_mode_control.show_menu = 1;
+    channel_mode_control.show_menu ?
+    (
+        set_x_y(channel_mode_control.control_x, channel_mode_control.y + channel_mode_control.h);
+        menu = gfx_showmenu
+        (
+            channel_mode == STEREO ? "!Stereo|Mono Left|Mono Right|Mono Downmix" :
+            channel_mode == LEFT ? "Stereo|!Mono Left|Mono Right|Mono Downmix" :
+            channel_mode == RIGHT ? "Stereo|Mono Left|!Mono Right|Mono Downmix" :
+            channel_mode == MIX ? "Stereo|Mono Left|Mono Right|!Mono Downmix";
+        );
+        menu ?
+        (
+            channel_mode_control.show_menu = 0;
+            channel_mode = menu - 1;
+        ) :
+        (
+            _mouse_click ? channel_mode_control.show_menu = 0;
+        );
+    ) :
+    channel_mode_control.mouse_hover && _mouse_wheel ?
+    (
+        channel_mode = clip(channel_mode - _mouse_wheel, 0, 3);
+    );
+    // Representation Toggle:
+    representation_control.value_string = representation == FIXED ? "Fixed Point" : "Floating Point";
+    representation_control.draw_control();
+    representation_control.mouse_click ? 
+    (
+        representation = !representation;
+
+        update_switch_panel_flag = 1;
+        update_transfer_curve_flag = 1;
+        update_main_background_flag = 1;
+        
+    ) :
+    representation_control.mouse_hover && _mouse_wheel ?
+    (
+        representation = !representation;
+        update_switch_panel_flag = 1;
+        update_transfer_curve_flag = 1;
+        update_main_background_flag = 1;
+    );
+    // Two's Complement Toggle:
+    representation == FIXED ?
+    (
+        twos_complement_control.value_string = twos_complement ? "Active" : "Disabled";
+        twos_complement_control.draw_control();
+        twos_complement_control.mouse_click ? 
+        (
+            twos_complement = !twos_complement;
+            update_transfer_curve_flag = 1;
+        );
+        twos_complement_control.mouse_hover && _mouse_wheel ?
+        (
+            twos_complement = clip(twos_complement + _mouse_wheel, 0, 1);
+            update_transfer_curve_flag = 1;
+        );
+    );
+);
+
+//////////////
+// GFX CODE //
+//////////////
+
+// ================================================================
+initialize_ui_flag ? initialize_parameters();
+gfx_h_previous != gfx_h || gfx_w_previous != gfx_w ?
+(
+    generate_noise();
+    update_main_background_flag = 1;
+);
+update_switch_panel_flag ? update_switch_panel();
+update_transfer_curve_flag ? update_transfer_curve();
+update_main_background_flag ? update_main_background();
+gfx_dest = main_framebuffer;
+gfx_mode = 0;
+_mouse_hover_target == -1 ? gfx_setcursor(32512);
+_mouse_hover_target = -1;
+get_global_mouse_state();
+
+// function _INFO_SCREEN() ================================
+info_screen_flag ?
+(
+    draw_info_screen();
+) :
+(
+    my_blit(main_background.framebuffer, 0, 0);
+    draw_title();
+    draw_Controls();
+    // BLIT Transfer Curve:
+    gfx_mode = 3;
+    my_blit(Curve.line_framebuffer, main_framebuffer,
+        Curve.x + Curve.border, Curve.y + Curve.border,
+        Curve.scale, 0);
+    gfx_mode = 0;
+    
+    // function _SWITCH_PANEL() ================================
+    
+    do_blinking ?
+    (
+        ui_sample = atomic_get(ui_sample_transfer);
+        ui_sample.transform_ui();
+    );
+    
+    // Buttons:
+    clear_all_button.draw_button();
+    clear_all_button.mouse_unclick ?
+    (
+        switches.upper_bits = 0;
+        switches.lower_bits = 0;
+        <? loop(i = 0; 64, printf("switch_%02d.status = 0;", i); i += 1); ?>
+        update_transfer_curve_flag = 1;
+    );
+    set_all_button.draw_button();
+    set_all_button.mouse_unclick ?
+    (
+        switches.upper_bits = $~32;
+        switches.lower_bits = $~32;
+        <? loop(i = 0; 64, printf("switch_%02d.status = 1;", i); i += 1); ?>
+        update_transfer_curve_flag = 1;
+    );
+    reset_mapping_button.draw_button();
+    reset_mapping_button.mouse_unclick ?
+    (
+        <?
+            loop(i = 0; j = 1; 64,
+                printf("switch_%02d.m = %d;", i, i);
+                printf("switch_%02d.map = %f;", i, j);
+            i += 1; j *= 2);
+        ?>
+        update_transfer_curve_flag = 1;
+    );
+    
+    // Draw Switches: (panel already on bg framebuffer)
+    <? loop(i = 63; 64, printf("switch_%02d.draw_switch();", i); i -= 1 ); ?>
+    
+    // function _FOOTER_BAR() ================================
+    
+    gfx_setfont(help_text.font);
+    set_x_y(main_margin, footer_bar.y + footer_bar.top_margin);
+    set_color(help_text.color);
+    help_text = max(_mouse_click_target,_mouse_hover_target);
+    //help_text == -1 ? help_text = "Welcome to Bit Switch :)";
+    help_text == -1 ? help_text =
+"Welcome to Bit Switch :)
+Click the title for aditional info and settings.
+";
+    //help_text == -1 ? help_text = "";
+    gfx_drawstr(help_text, 0);
+    
+    gfx_dest = main_framebuffer;
+    gfx_a = 1;
+    pixelate(N);
+    
+    // BLIT noise:
+    gfx_mode = 1;
+    gfx_dest = main_framebuffer;
+    my_blit(noise_framebuffer, 0, 0);
+    gfx_mode = 0;
+    gfx_w_previous = gfx_w; gfx_h_previous = gfx_h;
+    
+    xy_logging ? sprintf(#dbg_desc, "x: %d\ty: %d", clip(mouse_x, 0, gfx_w), clip(mouse_y, 0, gfx_h)); // Show mouse (x,y)
+    
+    info_screen_flag ?
+    (
+        set_canvas(info.framebuffer1, gfx_w, gfx_h);
+        my_blit(main_framebuffer,0,0);
+        info.p1 = 1;
+        info.p2 = 0;
+        info.p3 = 0;
+        info.t1.timer_reset();
+        info.t2.timer_reset();
+        info.t3.timer_reset();
+    );
+    
+);
+
