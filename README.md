@@ -1,5 +1,5 @@
 # Bit Switch 64
-Bit Switch is a JSFX audio effect plugin that enables real-time bitwise manipulation of incoming audio samples.
+A JSFX audio effect plugin enabling creative digital distortion by real-time bitwise manipulation of incoming audio samples.
 ## Features
 * Selectively switch individual bits of incoming samples permanently on or off.
 * Choose between the following switch modes:
